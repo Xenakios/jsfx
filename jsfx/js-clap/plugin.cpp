@@ -1,5 +1,6 @@
 #include "clap/events.h"
 #include "clap/ext/params.h"
+#include "clap/factory/plugin-factory.h"
 #include "clap/id.h"
 #include "windows.h"
 #include <handleapi.h>
@@ -350,7 +351,12 @@ const CLAP_EXPORT struct clap_plugin_factory the_factory = {
     clap_create_plugin,
 };
 
-static const void *get_factory(const char *factory_id) { return &the_factory; }
+static const void *get_factory(const char *factory_id)
+{
+    if (std::string(factory_id) == CLAP_PLUGIN_FACTORY_ID)
+        return &the_factory;
+    return nullptr;
+}
 
 // clap_init and clap_deinit are required to be fast, but we have nothing we need to do here
 bool clap_init(const char *p)
