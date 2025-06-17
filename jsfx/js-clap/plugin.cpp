@@ -1,4 +1,6 @@
+#include "clap/events.h"
 #include "clap/ext/params.h"
+#include "clap/id.h"
 #include "windows.h"
 #include <handleapi.h>
 #undef min
@@ -37,36 +39,36 @@ WDL_FastString g_root_path;
 struct JSFXClap : public clap::helpers::Plugin<clap::helpers::MisbehaviourHandler::Terminate,
                                                clap::helpers::CheckingLevel::Maximal>
 {
-    std::vector<float> paramValues;
-    std::vector<float> paramMods;
-    std::unordered_map<clap_id, float *> idToParamPointerMap;
-    std::unordered_map<clap_id, float *> idToParamModPointerMap;
     SX_Instance *m_sxinst = nullptr;
     std::string m_sxname;
     WDL_Mutex m_mutex;
     HWND m_hwndcfg, m_sxhwnd = 0;
     double sampleRate = 0.0f;
+    std::vector<double> m_default_par_values;
     JSFXClap(const clap_host *host, const clap_plugin_descriptor *desc)
         : clap::helpers::Plugin<clap::helpers::MisbehaviourHandler::Terminate,
                                 clap::helpers::CheckingLevel::Maximal>(desc, host)
 
     {
+        g_root_path.Set(R"(E:\PortableApps\reaper6)");
+        m_default_par_values.reserve(1024);
+        Open(R"(utility/volume_pan)");
     }
     bool activate(double sampleRate_, uint32_t minFrameCount,
                   uint32_t maxFrameCount) noexcept override
     {
         sampleRate = sampleRate_;
-        Open(R"(E:\PortableApps\reaper6\Effects\utility\volume_pan)");
+
         return true;
     }
-    void deactivate() noexcept override { Close(); }
+    void deactivate() noexcept override {}
     void Open(const char *name)
     {
         if (name && std::string(name) != m_sxname)
             m_sxname = name;
-        ;
-        SX_Instance *newinst = sx_createInstance(g_root_path.Get(), m_sxname.c_str(), NULL);
 
+        SX_Instance *newinst = sx_createInstance(g_root_path.Get(), m_sxname.c_str(), NULL);
+        assert(newinst);
         {
             WDL_MutexLock m(&m_mutex);
             Close();
@@ -74,6 +76,12 @@ struct JSFXClap : public clap::helpers::Plugin<clap::helpers::MisbehaviourHandle
 
             if (m_sxinst)
             {
+                int npars = sx_getNumParms(m_sxinst);
+                m_default_par_values.resize(npars);
+                for (int i = 0; i < npars; ++i)
+                {
+                    m_default_par_values[i] = sx_getParmVal(m_sxinst, i, nullptr, nullptr, nullptr);
+                }
                 sx_updateHostNch(m_sxinst, -1);
                 // sx_set_midi_ctx(m_sxinst, midi_sendrecv, this);
                 sx_set_host_ctx(m_sxinst, this, NULL);
@@ -99,11 +107,10 @@ struct JSFXClap : public clap::helpers::Plugin<clap::helpers::MisbehaviourHandle
     bool implementsParams() const noexcept override { return true; }
     bool isValidParamId(clap_id paramId) const noexcept override
     {
-        auto it = idToParamPointerMap.find(paramId);
-        if (it != idToParamPointerMap.end())
-        {
+        if (!m_sxinst)
+            return false;
+        if (paramId >= 0 && paramId < sx_getNumParms(m_sxinst))
             return true;
-        }
         return false;
     }
     uint32_t paramsCount() const noexcept override
@@ -120,9 +127,12 @@ struct JSFXClap : public clap::helpers::Plugin<clap::helpers::MisbehaviourHandle
             return false;
         info->cookie = nullptr;
         info->flags = CLAP_PARAM_IS_AUTOMATABLE;
-        info->default_value = 0.0;
-        info->min_value = 0.0;
-        info->max_value = 1.0;
+        info->default_value = m_default_par_values[paramIndex];
+        double minval = 0.0;
+        double maxval = 1.0;
+        sx_getParmVal(m_sxinst, paramIndex, &minval, &maxval, nullptr);
+        info->min_value = minval;
+        info->max_value = maxval;
         info->id = paramIndex;
         strcpy_s(info->module, "");
         sx_getParmName(m_sxinst, paramIndex, info->name, CLAP_NAME_SIZE);
@@ -142,8 +152,8 @@ struct JSFXClap : public clap::helpers::Plugin<clap::helpers::MisbehaviourHandle
     bool paramsValueToText(clap_id paramId, double value, char *display,
                            uint32_t size) noexcept override
     {
-
-        return false;
+        sprintf_s(display, size, "%f", value);
+        return true;
     }
     bool implementsNotePorts() const noexcept override { return false; }
     uint32_t notePortsCount(bool isInput) const noexcept override { return 0; }
@@ -169,13 +179,20 @@ struct JSFXClap : public clap::helpers::Plugin<clap::helpers::MisbehaviourHandle
     bool audioPortsInfo(uint32_t index, bool isInput,
                         clap_audio_port_info *info) const noexcept override
     {
-        // port id can be a "random" number
-        info->id = isInput ? 2112 : 90210;
-        strcpy_s(info->name, "main");
-        info->flags = CLAP_AUDIO_PORT_IS_MAIN;
-        info->channel_count = 2;
-        info->port_type = CLAP_PORT_STEREO;
-        return true;
+        if (index == 0)
+        {
+            info->id = isInput ? 5000 : 17000;
+            if (isInput)
+                strcpy_s(info->name, "main input");
+            else
+                strcpy_s(info->name, "main output");
+            info->flags = CLAP_AUDIO_PORT_IS_MAIN;
+            info->in_place_pair = CLAP_INVALID_ID;
+            info->channel_count = 2;
+            info->port_type = CLAP_PORT_STEREO;
+            return true;
+        }
+        return false;
     }
     void handleNextEvent(const clap_event_header_t *nextEvent, bool is_from_ui)
     {
@@ -203,10 +220,9 @@ struct JSFXClap : public clap::helpers::Plugin<clap::helpers::MisbehaviourHandle
         case CLAP_EVENT_PARAM_VALUE:
         {
             auto pevt = reinterpret_cast<const clap_event_param_value *>(nextEvent);
-            auto it = idToParamPointerMap.find(pevt->param_id);
-            if (it != idToParamPointerMap.end())
+            if (m_sxinst && pevt->param_id >= 0 && pevt->param_id < sx_getNumParms(m_sxinst))
             {
-                *it->second = pevt->value;
+                sx_setParmVal(m_sxinst, pevt->param_id, pevt->value, 0);
             }
             break;
         }
@@ -265,14 +281,23 @@ struct JSFXClap : public clap::helpers::Plugin<clap::helpers::MisbehaviourHandle
         }
         return CLAP_PROCESS_CONTINUE;
     }
-    bool implementsState() const noexcept override { return true; }
+    bool implementsState() const noexcept override { return false; }
     bool stateSave(const clap_ostream *stream) noexcept override
     {
         uint32_t version = 0;
         stream->write(stream, &version, sizeof(uint32_t));
         return true;
     }
-    bool stateLoad(const clap_istream *stream) noexcept override { return true; }
+    bool stateLoad(const clap_istream *stream) noexcept override
+    {
+        if (!stream)
+            return false;
+        char buf[1024];
+        auto r = stream->read(stream, (void *)buf, 1024);
+        if (r == 0)
+            return false;
+        return true;
+    }
     bool implementsGui() const noexcept override { return false; }
     bool guiIsApiSupported(const char *api, bool isFloating) noexcept override { return false; }
     // virtual bool guiGetPreferredApi(const char **api, bool *is_floating) noexcept { return false;
@@ -295,7 +320,7 @@ struct JSFXClap : public clap::helpers::Plugin<clap::helpers::MisbehaviourHandle
     // virtual bool guiSetTransient(const clap_window *window) noexcept { return false; }
 };
 
-const char *features[] = {CLAP_PLUGIN_FEATURE_UTILITY, nullptr};
+const char *features[] = {CLAP_PLUGIN_FEATURE_AUDIO_EFFECT, nullptr};
 clap_plugin_descriptor desc = {
     CLAP_VERSION, "com.xenakios.jsfx",   "mycompany jsfx", "mycompany", "", "", "",
     "0.0.0",      "mycompany donothing", features};
@@ -303,6 +328,8 @@ clap_plugin_descriptor desc = {
 static const clap_plugin *clap_create_plugin(const clap_plugin_factory *f, const clap_host *host,
                                              const char *plugin_id)
 {
+    if (std::string(plugin_id) != std::string(desc.id))
+        return nullptr;
     // I know it looks like a leak right? but the clap-plugin-helpers basically
     // take ownership and destroy the wrapper when the host destroys the
     // underlying plugin (look at Plugin<h, l>::clapDestroy if you don't believe me!)
@@ -326,7 +353,11 @@ const CLAP_EXPORT struct clap_plugin_factory the_factory = {
 static const void *get_factory(const char *factory_id) { return &the_factory; }
 
 // clap_init and clap_deinit are required to be fast, but we have nothing we need to do here
-bool clap_init(const char *p) { return true; }
+bool clap_init(const char *p)
+{
+    get_eel_funcdesc = default_get_eel_funcdesc;
+    return true;
+}
 
 void clap_deinit() {}
 
