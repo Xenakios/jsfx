@@ -26,15 +26,14 @@ add_library(jsfx MODULE
     WDL/eel2/nseel-compiler.c
     WDL/eel2/nseel-ram.c
     WDL/eel2/nseel-eval.c
+    WDL/eel2/asm-nseel-x64.obj
     WDL/lice/lice.cpp
     WDL/lice/lice_arc.cpp
     WDL/lice/lice_line.cpp
     WDL/lice/lice_text.cpp
     WDL/lice/lice_image.cpp
     WDL/lice/lice_textnew.cpp
-    WDL/eel2/asm-nseel-x64.obj
     WDL/localize/localize.cpp
-    # jsfx/standalone-helpers/meter-control.cpp
-    # jsfx/standalone-helpers/slider-control.cpp
 )
+
 target_compile_definitions(jsfx PRIVATE EEL_F_SIZE=4)
