@@ -46,6 +46,8 @@ struct JSFXClap : public clap::helpers::Plugin<clap::helpers::MisbehaviourHandle
     HWND m_hwndcfg, m_sxhwnd = 0;
     double sampleRate = 0.0f;
     std::vector<double> m_default_par_values;
+    std::vector<double> sxProcessingBuffer;
+    static constexpr size_t subChunkSize = 32;
     JSFXClap(const clap_host *host, const clap_plugin_descriptor *desc)
         : clap::helpers::Plugin<clap::helpers::MisbehaviourHandler::Terminate,
                                 clap::helpers::CheckingLevel::Maximal>(desc, host)
@@ -53,7 +55,8 @@ struct JSFXClap : public clap::helpers::Plugin<clap::helpers::MisbehaviourHandle
     {
         g_root_path.Set(R"(E:\PortableApps\reaper6)");
         m_default_par_values.reserve(1024);
-        Open(R"(utility/volume_pan)");
+        sxProcessingBuffer.resize(subChunkSize * 4);
+        Open(R"(delay/delay)");
     }
     bool activate(double sampleRate_, uint32_t minFrameCount,
                   uint32_t maxFrameCount) noexcept override
@@ -153,7 +156,9 @@ struct JSFXClap : public clap::helpers::Plugin<clap::helpers::MisbehaviourHandle
     bool paramsValueToText(clap_id paramId, double value, char *display,
                            uint32_t size) noexcept override
     {
-        sprintf_s(display, size, "%f", value);
+        if (!m_sxinst)
+            return false;
+        sx_getParmDisplay(m_sxinst, paramId, display, size, &value);
         return true;
     }
     bool implementsNotePorts() const noexcept override { return false; }
@@ -245,6 +250,9 @@ struct JSFXClap : public clap::helpers::Plugin<clap::helpers::MisbehaviourHandle
     clap_process_status process(const clap_process *process) noexcept override
     {
         auto frameCount = process->frames_count;
+        float *ip[2];
+        ip[0] = &process->audio_inputs->data32[0][0];
+        ip[1] = &process->audio_inputs->data32[1][0];
         float *op[2];
         op[0] = &process->audio_outputs->data32[0][0];
         op[1] = &process->audio_outputs->data32[1][0];
@@ -259,7 +267,7 @@ struct JSFXClap : public clap::helpers::Plugin<clap::helpers::MisbehaviourHandle
         {
             nextEvent = inEvents->get(inEvents, nextEventIndex);
         }
-        uint32_t chunkSize = 32;
+        uint32_t chunkSize = subChunkSize;
         uint32_t pos = 0;
 
         while (pos < frameCount)
@@ -275,9 +283,18 @@ struct JSFXClap : public clap::helpers::Plugin<clap::helpers::MisbehaviourHandle
                 else
                     nextEvent = inEvents->get(inEvents, nextEventIndex);
             }
-            choc::buffer::SeparateChannelLayout<float> layout(process->audio_outputs->data32, pos);
-            choc::buffer::ChannelArrayView<float> bufview(layout, {2, adjChunkSize});
-            bufview.clear();
+            for (int i = 0; i < adjChunkSize; ++i)
+            {
+                sxProcessingBuffer[i * 2 + 0] = ip[0][i + pos];
+                sxProcessingBuffer[i * 2 + 1] = ip[1][i + pos];
+            }
+            sx_processSamples(m_sxinst, sxProcessingBuffer.data(), adjChunkSize, 2, sampleRate,
+                              120.0, 4, 4, 1.0, 0.0, 0.0, 1.0, 1.0, 0);
+            for (int i = 0; i < adjChunkSize; ++i)
+            {
+                op[0][i + pos] = sxProcessingBuffer[i * 2 + 0];
+                op[1][i + pos] = sxProcessingBuffer[i * 2 + 1];
+            }
             pos += adjChunkSize;
         }
         return CLAP_PROCESS_CONTINUE;
