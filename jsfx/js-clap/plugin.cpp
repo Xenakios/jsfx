@@ -12,7 +12,7 @@
 #include "clap/helpers/host-proxy.hh"
 #include "clap/helpers/host-proxy.hxx"
 #include "clap/plugin-features.h"
-// #include "sst/basic-blocks/params/ParamMetadata.h"
+#include "gui/choc_MessageLoop.h"
 #include "containers/choc_SingleReaderSingleWriterFIFO.h"
 #include "audio/choc_SampleBuffers.h"
 #include <cstdint>
@@ -48,6 +48,7 @@ struct JSFXClap : public clap::helpers::Plugin<clap::helpers::MisbehaviourHandle
     std::vector<double> m_default_par_values;
     std::vector<double> sxProcessingBuffer;
     static constexpr size_t subChunkSize = 32;
+    choc::messageloop::Timer m_test_timer;
     JSFXClap(const clap_host *host, const clap_plugin_descriptor *desc)
         : clap::helpers::Plugin<clap::helpers::MisbehaviourHandler::Terminate,
                                 clap::helpers::CheckingLevel::Maximal>(desc, host)
@@ -56,23 +57,139 @@ struct JSFXClap : public clap::helpers::Plugin<clap::helpers::MisbehaviourHandle
         g_root_path.Set(R"(E:\PortableApps\reaper6)");
         m_default_par_values.reserve(1024);
         sxProcessingBuffer.resize(subChunkSize * 4);
-        Open(R"(delay/delay)");
+        m_test_timer = choc::messageloop::Timer{1000, [this]() {
+                                                    loadNextJSFX();
+                                                    return true;
+                                                }};
+    }
+    std::vector<std::string> m_test_fx{"delay/delay", "utility/volume_pan",
+                                       "sstillwell/eventhorizon2"};
+    int m_test_fx_counter = 0;
+    void loadNextJSFX()
+    {
+        std::cout << "opening " << m_test_fx[m_test_fx_counter] << std::endl;
+        Open(m_test_fx[m_test_fx_counter].c_str());
+        ++m_test_fx_counter;
+        if (m_test_fx_counter == m_test_fx.size())
+            m_test_fx_counter = 0;
     }
     bool activate(double sampleRate_, uint32_t minFrameCount,
                   uint32_t maxFrameCount) noexcept override
     {
         sampleRate = sampleRate_;
-
+        Open(R"(delay/delay)");
         return true;
     }
-    void deactivate() noexcept override {}
+    void deactivate() noexcept override { Close(); }
+    double midi_sendrecvFunc(int action, double *ts, double *msg1, double *msg23)
+    {
+        return 0.0;
+#ifdef JSCLAPMIDI
+        if (action < 0)
+        {
+            if (m_pelist)
+                while (m_pelist_rdpos < m_pelist->numEvents)
+                {
+                    VstEvent *evt = m_pelist->events[m_pelist_rdpos++];
+                    if (evt)
+                    {
+                        if (evt->type == kVstMidiType && evt->byteSize >= 24)
+                        {
+                            VstMidiEvent *e = (VstMidiEvent *)evt;
+
+                            *ts = (double)e->deltaFrames;
+                            unsigned char *md = (unsigned char *)e->midiData;
+                            *msg1 = (double)md[0];
+                            *msg23 = (double)((int)md[1] + ((int)md[2] << 8));
+                            return 1.0;
+                        }
+                        PassThruEvent(evt);
+                    }
+                }
+            if (!m_pelist_rdpos)
+                m_pelist_rdpos++;
+        }
+        else if (action == 1) // 3-byte send
+        {
+            int fo = (int)*ts;
+            if (fo < 0)
+                fo = 0;
+
+            VstMidiEvent *evt = (VstMidiEvent *)malloc(sizeof(VstMidiEvent));
+            memset(evt, 0, sizeof(VstMidiEvent));
+            evt->type = kVstMidiType;
+            evt->byteSize = 24;
+            evt->deltaFrames = fo;
+
+            int m = (int)*msg1;
+            if (m < 0x80)
+                m = 0x80;
+            else if (m > 0xff)
+                m = 0xff;
+            evt->midiData[0] = (unsigned char)m;
+            m = (int)(*msg23) & 0xff;
+            evt->midiData[1] = (unsigned char)m;
+            m = (((int)(*msg23)) >> 8) & 0xff;
+            evt->midiData[2] = (unsigned char)m;
+
+            m_midioutqueue.Add((VstEvent *)evt);
+            return 1.0;
+        }
+        else if (action == 2) // sysex
+        {
+            int fo = (int)*ts;
+            if (fo < 0)
+                fo = 0;
+
+            int len = (int)*msg23;
+            if (len < 0)
+                len = 0;
+
+            int offs = 0;
+            if (len >= 2 && (((int)msg1[0]) & 0xFF) == 0xF0 &&
+                (((int)msg1[len - 1]) & 0xFF) == 0xF7) // we'll add this
+            {
+                ++offs;
+                len -= 2;
+            }
+
+            VstMidiSysexEvent *evt =
+                (VstMidiSysexEvent *)malloc(sizeof(VstMidiSysexEvent) + len + 2);
+            memset(evt, 0, sizeof(VstMidiSysexEvent) + len + 2);
+            unsigned char *syx = (unsigned char *)evt + sizeof(VstMidiSysexEvent);
+
+            evt->type = kVstSysExType;
+            evt->deltaFrames = fo;
+            evt->byteSize = sizeof(VstMidiSysexEvent);
+            evt->sysexDump = (char *)syx;
+            evt->dumpBytes = len + 2;
+
+            syx[0] = 0xF0;
+            int i;
+            for (i = 0; i < len; ++i)
+                syx[i + 1] = (((int)msg1[i + offs]) & 0xFF);
+            syx[len + 1] = 0xF7;
+
+            m_midioutqueue.Add((VstEvent *)evt);
+            return 1.0;
+        }
+
+        return 0.0;
+#endif
+    }
+    static double midi_sendrecv(void *ctx, int action, double *ts, double *msg1, double *msg23,
+                                double *midibus)
+    {
+        JSFXClap *_this = (JSFXClap *)ctx;
+        return _this->midi_sendrecvFunc(action, ts, msg1, msg23);
+    }
     void Open(const char *name)
     {
         if (name && std::string(name) != m_sxname)
             m_sxname = name;
 
         SX_Instance *newinst = sx_createInstance(g_root_path.Get(), m_sxname.c_str(), NULL);
-        assert(newinst);
+        // assert(newinst);
         {
             WDL_MutexLock m(&m_mutex);
             Close();
@@ -87,8 +204,10 @@ struct JSFXClap : public clap::helpers::Plugin<clap::helpers::MisbehaviourHandle
                     m_default_par_values[i] = sx_getParmVal(m_sxinst, i, nullptr, nullptr, nullptr);
                 }
                 sx_updateHostNch(m_sxinst, -1);
-                // sx_set_midi_ctx(m_sxinst, midi_sendrecv, this);
+                sx_set_midi_ctx(m_sxinst, midi_sendrecv, this);
                 sx_set_host_ctx(m_sxinst, this, NULL);
+                // this doesn't seem to do anything in Bitwig and in Reaper seems to occasionally crash...
+                _host.paramsRescan(CLAP_PARAM_RESCAN_ALL);
             }
         }
 
@@ -228,6 +347,9 @@ struct JSFXClap : public clap::helpers::Plugin<clap::helpers::MisbehaviourHandle
             auto pevt = reinterpret_cast<const clap_event_param_value *>(nextEvent);
             if (m_sxinst && pevt->param_id >= 0 && pevt->param_id < sx_getNumParms(m_sxinst))
             {
+                // not completely clear what the sample offset refers to, but maybe a
+                // good guess would be offset from the current processing buffer start...?
+                // in which case we could use pevt->header.time as expected
                 sx_setParmVal(m_sxinst, pevt->param_id, pevt->value, 0);
             }
             break;
@@ -249,6 +371,7 @@ struct JSFXClap : public clap::helpers::Plugin<clap::helpers::MisbehaviourHandle
 
     clap_process_status process(const clap_process *process) noexcept override
     {
+        WDL_MutexLock m(&m_mutex);
         auto frameCount = process->frames_count;
         float *ip[2];
         ip[0] = &process->audio_inputs->data32[0][0];
@@ -318,7 +441,8 @@ struct JSFXClap : public clap::helpers::Plugin<clap::helpers::MisbehaviourHandle
     }
     bool implementsGui() const noexcept override { return false; }
     bool guiIsApiSupported(const char *api, bool isFloating) noexcept override { return false; }
-    // virtual bool guiGetPreferredApi(const char **api, bool *is_floating) noexcept { return false;
+    // virtual bool guiGetPreferredApi(const char **api, bool *is_floating) noexcept { return
+    // false;
     // }
     bool guiCreate(const char *api, bool isFloating) noexcept override { return false; }
     void guiDestroy() noexcept override {}
