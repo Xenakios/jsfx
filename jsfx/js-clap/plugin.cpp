@@ -57,6 +57,7 @@ struct JSFXClap : public clap::helpers::Plugin<clap::helpers::MisbehaviourHandle
         g_root_path.Set(R"(E:\PortableApps\reaper6)");
         m_default_par_values.reserve(1024);
         sxProcessingBuffer.resize(subChunkSize * 4);
+        return;
         m_test_timer = choc::messageloop::Timer{1000, [this]() {
                                                     loadNextJSFX();
                                                     return true;
@@ -84,6 +85,7 @@ struct JSFXClap : public clap::helpers::Plugin<clap::helpers::MisbehaviourHandle
     double midi_sendrecvFunc(int action, double *ts, double *msg1, double *msg23)
     {
         return 0.0;
+        // TODO: implement for Clap
 #ifdef JSCLAPMIDI
         if (action < 0)
         {
@@ -206,9 +208,13 @@ struct JSFXClap : public clap::helpers::Plugin<clap::helpers::MisbehaviourHandle
                 sx_updateHostNch(m_sxinst, -1);
                 sx_set_midi_ctx(m_sxinst, midi_sendrecv, this);
                 sx_set_host_ctx(m_sxinst, this, NULL);
-                // this doesn't seem to do anything in Bitwig and in Reaper seems to occasionally crash...
-                _host.paramsRescan(CLAP_PARAM_RESCAN_ALL);
             }
+        }
+        if (m_sxinst)
+        {
+            // this doesn't refresh the generic plugin parameter editors in Bitwig and Reaper
+            // also, in Reaper may be causing crashes/hangs
+            _host.paramsRescan(CLAP_PARAM_RESCAN_ALL);
         }
 
         if (m_hwndcfg)
