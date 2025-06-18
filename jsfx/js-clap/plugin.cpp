@@ -2,8 +2,10 @@
 #include "clap/ext/params.h"
 #include "clap/factory/plugin-factory.h"
 #include "clap/id.h"
+#include "dirscan.h"
 #include "windows.h"
 #include <handleapi.h>
+#include <windowsx.h>
 #undef min
 #undef max
 #include "clap/clap.h"
@@ -21,7 +23,8 @@
 #include "../reajs-vst2/resource.h"
 
 HINSTANCE g_hInst;
-
+bool g_allow_edit = false;
+char g_default_effect[256]; // if [0] == '!' then disable switching
 void Sliders_Init(HINSTANCE hInst, bool reg, int hslider_res_id = 0); // slider-control.cpp
 void Meters_Init(HINSTANCE hInst, bool reg);                          // meter-control.cpp
 
@@ -54,6 +57,7 @@ struct JSFXClap : public clap::helpers::Plugin<clap::helpers::MisbehaviourHandle
                                 clap::helpers::CheckingLevel::Maximal>(desc, host)
 
     {
+        memset(&m_auto_states, 0, sizeof(m_auto_states));
         g_root_path.Set(R"(E:\PortableApps\reaper6)");
         m_default_par_values.reserve(1024);
         sxProcessingBuffer.resize(subChunkSize * 4);
@@ -445,17 +449,86 @@ struct JSFXClap : public clap::helpers::Plugin<clap::helpers::MisbehaviourHandle
             return false;
         return true;
     }
-    bool implementsGui() const noexcept override { return false; }
-    bool guiIsApiSupported(const char *api, bool isFloating) noexcept override { return false; }
+    void CreateUI(HWND hwndDlg)
+    {
+        if (m_sxinst)
+        {
+            m_sxhwnd = sx_createUI(m_sxinst, g_hInst, hwndDlg, this);
+            if (m_sxhwnd)
+            {
+                RECT r;
+                GetWindowRect(GetDlgItem(hwndDlg, IDC_RECT), &r);
+                ScreenToClient(hwndDlg, (LPPOINT)&r);
+                ScreenToClient(hwndDlg, ((LPPOINT)&r) + 1);
+                bool forcesize = false;
+                if (!g_allow_edit)
+                {
+                    WDL_WndSizer__rec *r1 = m_sxinst->resizer.get_item(IDC_EDITFX);
+                    WDL_WndSizer__rec *r2 = m_sxinst->resizer.get_item(IDC_BUTTON1);
+                    WDL_WndSizer__rec *r3 = m_sxinst->resizer.get_item(IDC_EFFECTNAME);
+                    if (r1 && r2 && r3)
+                    {
+                        const int adj = r1->real_orig.right - r2->real_orig.right;
+                        r2->orig.left = (r2->real_orig.left += adj);
+                        r2->orig.right = (r2->real_orig.right += adj);
+                        r3->orig.right = (r3->real_orig.right += adj);
+                    }
+                    ShowWindow(GetDlgItem(m_sxhwnd, IDC_EDITFX), SW_HIDE);
+                }
+                if (!m_sxinst->m_config_items.GetSize())
+                {
+                    WDL_WndSizer__rec *r2 = m_sxinst->resizer.get_item(IDC_BUTTON1);
+                    WDL_WndSizer__rec *r3 = m_sxinst->resizer.get_item(IDC_EFFECTNAME);
+                    if (r2 && r3)
+                    {
+                        const int adj = r2->real_orig.right - r3->real_orig.right;
+                        r3->orig.right = (r3->real_orig.right += adj);
+                    }
+                    ShowWindow(GetDlgItem(m_sxhwnd, IDC_BUTTON1), SW_HIDE);
+                }
+
+                SetWindowPos(m_sxhwnd, NULL, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+                if (forcesize)
+                    SendMessage(m_sxhwnd, WM_SIZE, 0, 0);
+
+                ShowWindow(m_sxhwnd, SW_SHOWNA);
+            }
+        }
+    }
+    bool implementsGui() const noexcept override { return true; }
+    bool guiIsApiSupported(const char *api, bool isFloating) noexcept override
+    {
+        if (isFloating)
+            return false;
+        if (!strcmp(api, "win32"))
+            return true;
+        return false;
+    }
     // virtual bool guiGetPreferredApi(const char **api, bool *is_floating) noexcept { return
     // false;
     // }
-    bool guiCreate(const char *api, bool isFloating) noexcept override { return false; }
-    void guiDestroy() noexcept override {}
+    bool guiCreate(const char *api, bool isFloating) noexcept override
+    {
+        if (isFloating)
+            return false;
+        if (!strcmp(api, "win32"))
+        {
+            return true;
+        }
+
+        return false;
+    }
+    void guiDestroy() noexcept override { DestroyWindow(m_hwndcfg); }
     // virtual bool guiSetScale(double scale) noexcept { return false; }
-    bool guiShow() noexcept override { return false; }
-    bool guiHide() noexcept override { return false; }
-    bool guiGetSize(uint32_t *width, uint32_t *height) noexcept override { return false; }
+    bool guiShow() noexcept override { return true; }
+    bool guiHide() noexcept override { return true; }
+    bool guiGetSize(uint32_t *width, uint32_t *height) noexcept override
+    {
+        *width = m_last_w;
+        *height = m_last_h;
+        return true;
+    }
     // virtual bool guiCanResize() const noexcept { return false; }
     // virtual bool guiGetResizeHints(clap_gui_resize_hints_t *hints) noexcept { return false; }
     bool guiAdjustSize(uint32_t *width, uint32_t *height) noexcept override
@@ -464,7 +537,400 @@ struct JSFXClap : public clap::helpers::Plugin<clap::helpers::MisbehaviourHandle
     }
     // virtual bool guiSetSize(uint32_t width, uint32_t height) noexcept { return false; }
     // virtual void guiSuggestTitle(const char *title) noexcept {}
-    bool guiSetParent(const clap_window *window) noexcept override { return false; }
+    int m_last_w = 700;
+    int m_last_h = 500;
+    WDL_WndSizer m_resizer;
+    struct AudioMasterCallback
+    {
+    };
+    AudioMasterCallback *m_cb = nullptr;
+    bool m_auto_states[NUM_SLIDERS];
+    short cfgRect[4] = {0, 0, 0, 0};
+    const char *escapeAmpersandsForMenu(
+        const char *in, char *buf,
+        int bufsz) // converts & to && on all platforms, returns either in or buf
+    {
+        const char *oin = in;
+        if (!in || !buf || bufsz < 1)
+            return oin;
+
+        int nc = 0;
+        int opos = 0;
+        while (*in && opos < bufsz - 1)
+        {
+            if (*in == '&')
+            {
+                if (opos >= bufsz - 2)
+                    break;
+                buf[opos++] = '&';
+                nc++;
+            }
+            buf[opos++] = *in++;
+        }
+        if (!nc)
+            return oin;
+
+        buf[opos] = 0;
+        return buf;
+    }
+    void InsertMenuItemFilter(HMENU hMenu, int pos, BOOL byPos, MENUITEMINFO *mi)
+    {
+        if (mi && (mi->fMask & MIIM_TYPE) && mi->fType == MFT_STRING && mi->dwTypeData &&
+            strstr(mi->dwTypeData, "&"))
+        {
+            MENUITEMINFO m = *mi;
+            char tmp[2048];
+            m.dwTypeData = (char *)escapeAmpersandsForMenu(mi->dwTypeData, tmp, sizeof(tmp));
+            InsertMenuItem(hMenu, pos, byPos, &m);
+        }
+        else
+        {
+            InsertMenuItem(hMenu, pos, byPos, mi);
+        }
+    }
+    HMENU CreateMenuForPath(const char *path, WDL_PtrList<char> *menufns)
+    {
+        HMENU hMenu = NULL;
+
+        int subpos = 0;
+        int itempos = 0;
+
+        WDL_DirScan ds;
+        if (!ds.First(path))
+        {
+            do
+            {
+                const char *fn = ds.GetCurrentFN();
+                if (fn[0] != '.')
+                {
+                    if (ds.GetCurrentIsDirectory())
+                    {
+                        WDL_FastString tmp(path);
+                        tmp.Append("/");
+                        tmp.Append(fn);
+                        HMENU sub = CreateMenuForPath(tmp.Get(), menufns);
+                        if (sub)
+                        {
+                            if (!hMenu)
+                                hMenu = CreatePopupMenu();
+                            MENUITEMINFO mii = {sizeof(mii), MIIM_SUBMENU | MIIM_TYPE | MIIM_STATE,
+                                                MFT_STRING,  MFS_ENABLED,
+                                                0,           sub,
+                                                0,           0,
+                                                0,           (char *)fn};
+                            InsertMenuItemFilter(hMenu, subpos++, TRUE, &mii);
+                        }
+                    }
+                    else
+                    {
+                        const char *ext = fn;
+                        while (*ext)
+                            ext++;
+                        while (ext > fn && *ext != '.')
+                            ext--;
+                        if (ext == fn ||
+                            (stricmp(ext, ".png") && stricmp(ext, ".dll") &&
+                             stricmp(ext, ".jsfx-inc") && stricmp(ext, ".jpg") &&
+                             stricmp(ext, ".zip") && stricmp(ext, ".exe") && stricmp(ext, ".dat") &&
+                             stricmp(ext, ".bmp") && stricmp(ext, ".rpl") && stricmp(ext, ".db") &&
+                             stricmp(ext, ".wav") && stricmp(ext, ".ogg")))
+                        {
+                            if (!hMenu)
+                                hMenu = CreatePopupMenu();
+
+                            WDL_FastString tmp(path);
+                            tmp.Append("/");
+                            tmp.Append(fn);
+                            menufns->Add(strdup(tmp.Get()));
+
+                            MENUITEMINFO mii = {sizeof(mii),
+                                                MIIM_TYPE | MIIM_ID | MIIM_STATE,
+                                                MFT_STRING,
+                                                MFS_ENABLED,
+                                                (UINT)menufns->GetSize(),
+                                                NULL,
+                                                0,
+                                                0,
+                                                0,
+                                                (char *)fn};
+                            InsertMenuItemFilter(hMenu, subpos + itempos++, TRUE, &mii);
+                        }
+                    }
+                }
+            } while (!ds.Next());
+        }
+        return hMenu;
+    }
+    bool DoEffectMenu(HWND hwndParent, int xpos, int ypos)
+    {
+        WDL_FastString curpath(g_root_path.Get());
+        curpath.Append("/effects");
+        WDL_PtrList<char> fns;
+        HMENU hMenu = CreateMenuForPath(curpath.Get(), &fns);
+
+        if (!hMenu)
+        {
+            hMenu = CreatePopupMenu();
+            MENUITEMINFO mii = {
+                sizeof(mii), MIIM_TYPE | MIIM_STATE,        MFT_STRING, MFS_GRAYED, 0, NULL, 0, 0,
+                0,           (char *)"No JS effects found!"};
+            InsertMenuItem(hMenu, 0, TRUE, &mii);
+        }
+        int ret =
+            TrackPopupMenu(hMenu, TPM_NONOTIFY | TPM_RETURNCMD, xpos, ypos, 0, hwndParent, NULL);
+
+        if (fns.Get(ret - 1))
+        {
+            char *p = fns.Get(ret - 1);
+            if (strlen(p) > strlen(curpath.Get()) &&
+                !strnicmp(p, curpath.Get(), strlen(curpath.Get())))
+                p += strlen(curpath.Get()) + 1;
+            Open(p);
+        }
+        else
+            ret = 0;
+        fns.Empty(true);
+        DestroyMenu(hMenu);
+        return !!ret;
+    }
+    WDL_DLGRET CfgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
+    {
+        static int m_ignore_editmsg;
+        static HWND resizeCap;
+        static int resizeCap_xo, resizeCap_yo;
+        switch (uMsg)
+        {
+        case WM_INITDIALOG:
+            m_hwndcfg = hwndDlg;
+            m_resizer.init(hwndDlg);
+            m_resizer.init_item(IDC_FRAME, 0, 0, 1, 1);
+            m_resizer.init_item(IDC_RECT, 0, 0, 1, 1);
+            if (g_default_effect[0] != '!')
+            {
+                m_resizer.init_item(IDC_CUREFFECT, 0, 0, 1, 0);
+                m_resizer.init_item(IDC_BUTTON1, 1, 0, 1, 0);
+            }
+
+            SetDlgItemText(hwndDlg, IDC_FRAME, "ReaJS by Cockos Incorporated - www.reaper.fm");
+
+            if (g_default_effect[0] != '!')
+                SetDlgItemText(hwndDlg, IDC_CUREFFECT, m_sxname.c_str());
+
+            if (m_last_w > 0 && m_last_h > 0)
+            {
+                SetWindowPos(hwndDlg, NULL, 0, 0, m_last_w, m_last_h,
+                             SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE);
+            }
+
+            CreateUI(hwndDlg);
+
+            ShowWindow(hwndDlg, SW_SHOWNA);
+            return 0;
+        case WM_USER + 1040:
+        {
+            bool isEnd = false;
+            if (wParam & 0x80000000)
+            {
+                wParam &= ~0x80000000;
+                isEnd = true;
+            }
+
+            // if (m_cb && wParam < (WPARAM)m_effect.numParams && m_sxinst)
+            if (m_cb && wParam < (WPARAM)256 && m_sxinst)
+            {
+
+                double minv = 0.0, maxv = 1.0,
+                       v = sx_getParmVal(m_sxinst, wParam, &minv, &maxv, NULL);
+                if (v <= minv)
+                    v = 0.0;
+                else if (v >= maxv)
+                    v = 1.0;
+                else
+                    v = ((v - minv) / (maxv - minv));
+
+                if (!m_auto_states[wParam])
+                {
+                    m_auto_states[wParam] = true;
+                    // m_cb(&m_effect, audioMasterBeginEdit, wParam, 0, NULL, 0.0f);
+                }
+
+                // m_cb(&m_effect, audioMasterAutomate, wParam, 0, NULL, (float)v);
+                if (isEnd)
+                {
+                    m_auto_states[wParam] = false;
+                    // m_cb(&m_effect, audioMasterEndEdit, wParam, 0, NULL, 0.0f);
+                }
+            }
+        }
+
+            return 0;
+        case WM_SETCURSOR:
+        {
+            RECT r;
+            POINT p;
+            GetCursorPos(&p);
+            GetClientRect(hwndDlg, &r);
+            ScreenToClient(hwndDlg, &p);
+            int dx = r.right - p.x;
+            int dy = r.bottom - p.y;
+            if (dx >= 0 && dy >= 0 && dx + dy < 16)
+            {
+                SetCursor(LoadCursor(NULL, IDC_SIZENWSE));
+            }
+            else
+                SetCursor(LoadCursor(NULL, IDC_ARROW));
+        }
+            return 1;
+        case WM_LBUTTONDOWN:
+        {
+            RECT r;
+            GetClientRect(hwndDlg, &r);
+            resizeCap_xo = GET_X_LPARAM(lParam);
+            resizeCap_yo = GET_Y_LPARAM(lParam);
+            int dx = r.right - resizeCap_xo;
+            int dy = r.bottom - resizeCap_yo;
+            if (dx >= 0 && dy >= 0 && dx + dy < 16)
+            {
+                SetCapture(resizeCap = hwndDlg);
+            }
+        }
+            return 0;
+        case WM_MOUSEMOVE:
+            if (GetCapture() == hwndDlg && resizeCap == hwndDlg)
+            {
+                RECT r;
+                GetClientRect(hwndDlg, &r);
+                int newx = GET_X_LPARAM(lParam) - resizeCap_xo;
+                int newy = GET_Y_LPARAM(lParam) - resizeCap_yo;
+                if (newx || newy)
+                {
+                    resizeCap_xo += newx;
+                    resizeCap_yo += newy;
+                    newx += r.right;
+                    newy += r.bottom;
+                    if (newx < 100)
+                        newx = 100;
+                    if (newy < 100)
+                        newy = 100;
+                    m_last_w = newx;
+                    m_last_h = newy;
+
+                    if (newx != r.right || newy != r.bottom)
+                        SetWindowPos(hwndDlg, NULL, 0, 0, newx, newy,
+                                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+
+                    cfgRect[0] = r.top;
+                    cfgRect[1] = r.left;
+                    cfgRect[2] = r.top + newy;
+                    cfgRect[3] = r.left + newx;
+
+                    int dx = newx - r.right, dy = newy - r.bottom;
+
+                    HWND parent = GetParent(hwndDlg);
+                    if (parent)
+                    {
+                        HWND gparent = (GetWindowLong(parent, GWL_STYLE) & WS_CHILD)
+                                           ? GetParent(parent)
+                                           : NULL;
+                        RECT r, r2;
+                        GetWindowRect(parent, &r);
+                        if (gparent)
+                            GetWindowRect(gparent, &r2);
+
+                        SetWindowPos(parent, NULL, 0, 0, r.right - r.left + dx,
+                                     abs(r.bottom - r.top) + dy, SWP_NOMOVE | SWP_NOZORDER);
+                        if (gparent)
+                            SetWindowPos(gparent, NULL, 0, 0, r2.right - r2.left + dx,
+                                         abs(r2.bottom - r2.top) + dy, SWP_NOMOVE | SWP_NOZORDER);
+                    }
+                }
+            }
+            return 0;
+        case WM_LBUTTONUP:
+            ReleaseCapture();
+            resizeCap = 0;
+            return 0;
+        case WM_SIZE:
+            if (wParam != SIZE_MINIMIZED)
+            {
+                m_resizer.onResize();
+                if (m_sxhwnd)
+                {
+                    RECT r;
+                    GetWindowRect(GetDlgItem(hwndDlg, IDC_RECT), &r);
+                    ScreenToClient(hwndDlg, (LPPOINT)&r);
+                    ScreenToClient(hwndDlg, ((LPPOINT)&r) + 1);
+                    SetWindowPos(m_sxhwnd, NULL, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                                 SWP_NOZORDER | SWP_NOACTIVATE);
+                }
+            }
+            return 0;
+        case WM_COMMAND:
+            switch (LOWORD(wParam))
+            {
+            case IDC_BUTTON1:
+                if (g_default_effect[0] != '!')
+                {
+                    RECT r;
+                    GetWindowRect(GetDlgItem(hwndDlg, LOWORD(wParam)), &r);
+                    if (DoEffectMenu(hwndDlg, r.left, r.bottom))
+                    {
+                        SetDlgItemText(hwndDlg, IDC_CUREFFECT, m_sxname.c_str());
+                        // todo: notify other stuff?
+                    }
+                }
+                break;
+            }
+            return 0;
+        case WM_USER + 1000:
+            CreateUI(hwndDlg);
+            if (g_default_effect[0] != '!')
+                SetDlgItemText(hwndDlg, IDC_CUREFFECT, m_sxname.c_str());
+            return 0;
+        case WM_DESTROY:
+            m_resizer.init(NULL);
+
+            if (m_sxinst)
+            {
+                sx_deleteUI(m_sxinst);
+                m_sxhwnd = 0;
+            }
+            m_hwndcfg = 0;
+            return 0;
+        }
+        return 0;
+    }
+    static WDL_DLGRET dlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
+    {
+        if (uMsg == WM_INITDIALOG)
+            SetWindowLongPtr(hwndDlg, GWLP_USERDATA, lParam);
+        JSFXClap *_this = (JSFXClap *)GetWindowLongPtr(hwndDlg, GWLP_USERDATA);
+        if (_this)
+            return _this->CfgProc(hwndDlg, uMsg, wParam, lParam);
+
+#ifdef _WIN32
+        if (uMsg >= 0x127 && uMsg <= 0x129)
+        {
+            SetWindowLongPtr(hwndDlg, DWLP_MSGRESULT, 0);
+            return 1;
+        }
+#endif
+        return 0;
+    }
+    bool guiSetParent(const clap_window *window) noexcept override
+    {
+        if (m_hwndcfg)
+            DestroyWindow(m_hwndcfg);
+
+        m_hwndcfg = CreateDialogParam(g_hInst,
+                                      g_default_effect[0] == '!' ? MAKEINTRESOURCE(IDD_VST_CFG2)
+                                                                 : MAKEINTRESOURCE(IDD_VST_CFG),
+                                      (HWND)window->win32, dlgProc, (LPARAM)this);
+
+        assert(m_hwndcfg != 0);
+        SetParent(m_hwndcfg, (HWND)window->win32);
+        return true;
+    }
     // virtual bool guiSetTransient(const clap_window *window) noexcept { return false; }
 };
 
